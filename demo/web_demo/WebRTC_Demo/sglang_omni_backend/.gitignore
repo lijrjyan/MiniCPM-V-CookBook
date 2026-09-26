@@ -1,0 +1,6 @@
+*-venv/
+logs/
+runs/
+dumps*/
+__pycache__/
+deploy/env.local.sh
