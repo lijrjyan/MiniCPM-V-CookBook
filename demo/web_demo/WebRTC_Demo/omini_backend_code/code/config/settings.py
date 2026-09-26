@@ -159,6 +159,12 @@ class Settings(BaseSettings):
         env_nested_delimiter="__",  # 支持嵌套配置，如 REDIS__HOST
     )
 
+    @classmethod
+    def settings_customise_sources(cls, settings_cls, init_settings, env_settings, dotenv_settings, file_secret_settings):
+        # from_yaml passes the YAML as init kwargs, which pydantic-settings ranks above the environment by default;
+        # put the environment first so SERVER__PORT, LIVEKIT__URL, ... really override the YAML as documented above.
+        return env_settings, init_settings, dotenv_settings, file_secret_settings
+
     @field_validator("app_env")
     @classmethod
     def validate_env(cls, v: str) -> str:

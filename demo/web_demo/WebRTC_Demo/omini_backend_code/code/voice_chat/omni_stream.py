@@ -1,6 +1,7 @@
 import asyncio
 from collections import deque
 from datetime import datetime
+import os
 import uuid
 import numpy as np
 from scipy.signal import resample_poly
@@ -15,6 +16,7 @@ from voice_chat.model_call import MiniCpmModel
 from common.enums.model_type import ModelType
 from concurrent.futures import ThreadPoolExecutor
 from config.settings import get_voice_chat_settings
+from voice_chat.stream_resample import StreamResampler
 
 # 获取日志器
 logger = get_enhanced_logger('voice_chat')
@@ -22,6 +24,11 @@ logger = get_enhanced_logger('voice_chat')
 # VAD 检测专用线程池（独立于全局线程池，避免被其他长时间任务阻塞）
 # 增加worker数量以支持更多并发用户（每个用户并发VAD检测）
 _vad_thread_pool = ThreadPoolExecutor(max_workers=10, thread_name_prefix="VAD")
+
+# Latency patch: audio goes to the inference service in PREFILL_CHUNK_MS pieces (upstream: 1000), and duplex keeps
+# one streaming_generate open at a time (reopened when it ends) instead of starting one per chunk.
+PREFILL_CHUNK_MS = int(os.getenv("OMNI_PREFILL_CHUNK_MS", "80"))
+DUPLEX_KEEP_OPEN = os.getenv("OMNI_DUPLEX_KEEP_OPEN", "1") == "1"
 
 
 class OmniStream:
@@ -56,8 +63,11 @@ class OmniStream:
         self.vad_race_text_queue = asyncio.Queue()
         self.vad_race_task = None  # 跟踪当前抢跑任务
 
-        # 双工延迟时间 延缓双工的卡顿
-        self.duplex_delay_time_flag = False
+        # ordered prefill sender and the stateful 48 kHz -> 16 kHz input resampler
+        self.prefill_queue = asyncio.Queue()
+        self.prefill_task = None
+        self.input_resampler = StreamResampler(48000, 16000)
+        self.generate_loop_task = None
 
         # 音频配置
         self.WEBRTC_SAMPLE_RATE = 48000
@@ -108,8 +118,8 @@ class OmniStream:
             tuple: (updated_audio_data_buffer, updated_buffer_duration)
         """
         # 计算需要保留的数据量
-        logger.info(f"process_audio_batch buffer_duration: {buffer_duration}, target_duration: {target_duration}")
-        remaining_duration = buffer_duration - target_duration
+        logger.debug(f"process_audio_batch buffer_duration: {buffer_duration}, target_duration: {target_duration}")
+        remaining_duration = buffer_duration % target_duration
         remaining_samples = int((remaining_duration / 1000) * self.WEBRTC_SAMPLE_RATE)
 
         # 合并所有缓冲的音频数据
@@ -144,11 +154,12 @@ class OmniStream:
             await self.text_output_queue.put("<state><vad_end>")
             await self.text_output_queue.put(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')} - <state><vad_end>")
             self.vad_stream_started = False
-        current_time = time.time()
+        output_resampler = None
         try:
             round_id = await self.shared_state.get_round()
             generator = self.model_cpm.streaming_generate(
-                session_id=self.session_id
+                session_id=self.session_id,
+                keep_open=DUPLEX_KEEP_OPEN and self.model_cpm.model_type == ModelType.DUPLEX,
             )
             # 每次生成后进行续命服务锁定
             service_manager = await get_service_manager()
@@ -171,20 +182,11 @@ class OmniStream:
 
                     audio_data = None
                     if wav_data is not None:
-                        # 重采样到 WebRTC 采样率
-                        resampled_data = resample_poly(
-                            wav_data,
-                            self.WEBRTC_SAMPLE_RATE, 
-                            tts_sample_rate, 
-                            padtype='line'
-                        )
-                        
-                        # wav_data 已经是 int16 格式，重采样后需要 clip 到有效范围
-                        audio_data = np.clip(resampled_data, -32768, 32767).astype(np.int16)
-                        # 将音频数据放入队列
-                        if self.model_cpm.model_type == ModelType.DUPLEX and not self.duplex_delay_time_flag:
-                            self.duplex_delay_time_flag = True
-                            await asyncio.sleep(1-(time.time() - current_time))
+                        # 重采样到 WebRTC 采样率 (stateful across this stream's chunks, off the event loop)
+                        if output_resampler is None:
+                            output_resampler = StreamResampler(tts_sample_rate, self.WEBRTC_SAMPLE_RATE)
+                        audio_data = await asyncio.to_thread(output_resampler.process, wav_data)
+                        # 将音频数据放入队列 (published at once: no first-reply hold)
                         await self.audio_output_queue.put(audio_data)
                     # 处理文本内容
                     text_content = chunk_data.get('text')
@@ -221,18 +223,27 @@ class OmniStream:
         # 使用实例变量来管理任务，确保回调函数能正确访问
         audio_data_buffer = []
         buffer_duration = 0
-        target_duration = 1000  # 目标缓冲区时长（毫秒）
+        target_duration = PREFILL_CHUNK_MS  # 目标缓冲区时长（毫秒）
+        duplex = self.model_cpm.model_type == ModelType.DUPLEX
         while not self.stop_event.is_set():
             try:
                 start_time = time.time()
                 
-                # 1. 收集音频数据
-                collected_data = await self._collect_audio_data()
+                # 1. 收集音频数据 (duplex: wake on the first frame instead of polling every 100 ms)
+                if duplex:
+                    try:
+                        first = await asyncio.wait_for(self.audio_input_queue.get(), timeout=0.2)
+                    except asyncio.TimeoutError:
+                        continue
+                    collected_data = ([first[0]] if isinstance(first, tuple) and len(first) == 3 else []) + await self._collect_audio_data()
+                else:
+                    collected_data = await self._collect_audio_data()
                 if collected_data:
-                    # 2. 处理音频缓冲区
+                    # 2. 处理音频缓冲区 (duplex needs no VAD window)
                     combined_data = np.concatenate(collected_data)
-                    audio_buffer.extend(combined_data)
-                    if len(audio_buffer) >= self.BUFFER_SIZE:
+                    if not duplex:
+                        audio_buffer.extend(combined_data)
+                    if duplex or len(audio_buffer) >= self.BUFFER_SIZE:
                         if self.model_cpm.model_type == ModelType.SIMPLEX:
                             # SIMPLEX模式：需要VAD检测
                             # 使用专用 VAD 线程池执行检测，避免被其他长时间任务阻塞
@@ -298,6 +309,7 @@ class OmniStream:
                                         await self.model_prefill(existing_audio, last_chunk=True)
                                     asyncio.create_task(self._handle_model_generate())
                                 # 单工输出之后清理之前的缓冲区数据
+                                self.input_resampler.reset()
                                 audio_buffer.clear()
                                 buffer_duration = 0
                                 audio_data_buffer = []
@@ -313,7 +325,10 @@ class OmniStream:
                             if buffer_duration >= target_duration:
                                 audio_data_buffer, buffer_duration = await self._process_audio_batch(audio_data_buffer, buffer_duration, target_duration)
                                 # 双工模式：尝试获取用户输入的文本数据，模型返回的数据
-                                asyncio.create_task(self._handle_model_generate())
+                                if not DUPLEX_KEEP_OPEN:
+                                    asyncio.create_task(self._handle_model_generate())
+                                elif self.generate_loop_task is None:
+                                    self.generate_loop_task = asyncio.create_task(self._duplex_generate_loop())
                 else:
                     # 没有音频数据时，短暂休眠
                     logger.debug("未收集到音频数据，继续等待...")
@@ -322,25 +337,46 @@ class OmniStream:
                 # 4. 控制循环频率（使用异步 sleep，不阻塞事件循环）
                 elapsed = time.time() - start_time
                 sleep_time = max(0, 0.1 - elapsed)
-                if sleep_time > 0:
+                if sleep_time > 0 and not duplex:
                     await asyncio.sleep(sleep_time)
 
             except Exception as e:
                 logger.error(f"音频处理错误: {str(e)}")
                 continue
+        for task in (self.generate_loop_task, self.prefill_task):
+            if task is not None:
+                task.cancel()
         await self.model_cpm.streaming_stop(session_id=self.session_id)
         logger.info(f"omniStream结束")
 
+    async def _duplex_generate_loop(self):
+        """Duplex: keep exactly one streaming_generate open; reopen it as soon as the service ends it."""
+        while not self.stop_event.is_set():
+            started = time.monotonic()
+            await self._handle_model_generate()
+            if time.monotonic() - started < 0.1:
+                await asyncio.sleep(0.1)  # the service refused or ended at once: do not spin
 
     async def model_prefill(self, audio_data: np.ndarray, last_chunk: bool = False):
         """
-        模型预填
+        模型预填: resampled to 16 kHz here (stateful) and sent in order by one sender task, so short chunks
+        cannot overtake each other on parallel HTTP connections.
         """
-        # 异步调用 streaming_prefill，使用 create_task 在后台运行
-        try:
-            asyncio.create_task(self.model_cpm.model_prefill(self.session_id, audio_data=audio_data, last_chunk=last_chunk))
-        except Exception as e:
-            logger.error(f"调用 model_prefill 失败: {e}")
+        self.prefill_queue.put_nowait((self.input_resampler.process(audio_data), last_chunk))
+        if self.prefill_task is None:
+            self.prefill_task = asyncio.create_task(self._prefill_sender())
+
+    async def _prefill_sender(self):
+        while True:
+            audio_data, last_chunk = await self.prefill_queue.get()
+            # after a stall, send everything queued (up to a last_chunk marker) as one request
+            while not last_chunk and not self.prefill_queue.empty():
+                more, last_chunk = self.prefill_queue.get_nowait()
+                audio_data = np.concatenate([audio_data, more])
+            try:
+                await self.model_cpm.model_prefill(self.session_id, audio_data=audio_data, last_chunk=last_chunk, audio_sample_rate=16000)
+            except Exception as e:
+                logger.error(f"调用 model_prefill 失败: {e}")
 
 
 

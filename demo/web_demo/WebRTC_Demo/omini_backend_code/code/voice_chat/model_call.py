@@ -76,7 +76,8 @@ class MiniCpmModel ():
 
 
    async def model_prefill(self, session_id: str, audio_data: Optional[np.ndarray] = None,
-        image_data: Optional[Union[np.ndarray, bytes]] = None, last_chunk: bool = False) -> Dict[str, Any]:
+        image_data: Optional[Union[np.ndarray, bytes]] = None, last_chunk: bool = False,
+        audio_sample_rate: int = WEBRTC_SAMPLE_RATE) -> Dict[str, Any]:
         roundId = await self.shared_state.get_round()
         image_audio_id = await self.shared_state.get_current_image_audio_id()
         # 模型如果是单工并且正在输出，则直接返回
@@ -86,7 +87,7 @@ class MiniCpmModel ():
         # 编码为 base64
         audio_content = None
         if audio_data is not None and len(audio_data) > 0:
-            audio_content = self._encode_audio_to_base64(audio_data, input_sample_rate=self.WEBRTC_SAMPLE_RATE, output_sample_rate=16000)
+            audio_content = self._encode_audio_to_base64(audio_data, input_sample_rate=audio_sample_rate, output_sample_rate=16000)
         image_content = None
         if image_data is not None:
             image_content = self._encode_image_to_base64(image_data, image_format="jpeg")
@@ -124,9 +125,9 @@ class MiniCpmModel ():
                json_data=request_data,
                headers={'Content-Type': 'application/json'}
            )
-           logger.info(f"Omni prefill请求返回结果: {response}")
+           logger.debug(f"Omni prefill请求返回结果: {response}")  # latency patch: per-chunk lines at debug (12.5 chunks/s)
            if response['success']:
-               logger.info(f"Omni prefill请求成功: {response['status_code']}")
+               logger.debug(f"Omni prefill请求成功: {response['status_code']}")
                return response['data']
            else:
                #logger.error(f"Omni prefill请求失败: {response['status_code']} - {response.get('data', 'Unknown error')}, request_data: {request_data}")
@@ -142,6 +143,7 @@ class MiniCpmModel ():
    async def streaming_generate(
          self,
          session_id: str,
+         keep_open: bool = False,
         ) -> Generator[Dict[str, Any], None, None]:
       """
       Omni流式生成接口
@@ -171,6 +173,9 @@ class MiniCpmModel ():
               "mode": self.model_type.value,
               "stream": True
           }
+          if keep_open:
+              # latency patch: this stream is the session's only open generate; the service keeps it open
+              request_data["keep_open"] = True
           
           # 构建API URL
           api_url = f"{self.api_base_url}/omni/streaming_generate"
