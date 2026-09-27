@@ -69,7 +69,7 @@
 | **MiniCPM-V 4.5**  | 8B     | BF16 / FP16       | vLLM / SGLang | **≥ 18 GB**  |    —       |
 |                    |        | AWQ (int4)        | vLLM          | **≥ 8 GB**   |    —       |
 |                    |        | GGUF Q4_K_M       | llama.cpp / Ollama | ≥ 6 GB  | ≥ 7 GB     |
-| **MiniCPM-o 4.5**  | 9B     | BF16 / FP16       | vLLM          | **≥ 20 GB**  |    —       |
+| **MiniCPM-o 4.5**  | 9B     | BF16 / FP16       | vLLM / [SGLang（sglang-omni，全双工）](./sglang/minicpm-o4_5_sglang_zh.md) | **≥ 20 GB**  |    —       |
 |                    |        | GGUF Q4_K_M       | llama.cpp     | ≥ 7 GB       | ≥ 8 GB     |
 | **MiniCPM-V 4.0**  | 4B     | BF16 / FP16       | vLLM / SGLang | ≥ 10 GB      |    —       |
 |                    |        | GGUF Q4_K_M       | llama.cpp / Ollama | ≥ 3 GB  | ≥ 4 GB     |

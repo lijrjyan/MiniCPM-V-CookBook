@@ -14,5 +14,5 @@ MiniCPM-o 系列的全模态旗舰版本 —— 视觉、语音、全双工实�
 ## 入口
 
 - **音频示例：** [语音转文本](inference/speech2text.html)、[文本转语音](inference/text2speech.html)、[语音克隆](inference/voice-clone.html)
-- **部署：** [vLLM](deployment/vllm.html)、[SGLang](deployment/sglang.html)、[llama.cpp](deployment/llamacpp.html)、[Ollama](deployment/ollama.html)
+- **部署：** [vLLM](deployment/vllm.html)、[SGLang（sglang-omni 全双工）](deployment/sglang.html)、[llama.cpp](deployment/llamacpp.html)、[Ollama](deployment/ollama.html)
 - **量化：** [GGUF](quantization/gguf.html)

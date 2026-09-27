@@ -14,5 +14,5 @@ For real-time, full-duplex demos see the [MiniCPM-o-Demo](https://github.com/Ope
 ## Where to start
 
 - **Audio recipes:** [Speech-to-Text](inference/speech2text.html), [Text-to-Speech](inference/text2speech.html), [Voice Cloning](inference/voice-clone.html)
-- **Deploy:** [vLLM](deployment/vllm.html), [SGLang](deployment/sglang.html), [llama.cpp](deployment/llamacpp.html), [Ollama](deployment/ollama.html)
+- **Deploy:** [vLLM](deployment/vllm.html), [SGLang (sglang-omni, full-duplex)](deployment/sglang.html), [llama.cpp](deployment/llamacpp.html), [Ollama](deployment/ollama.html)
 - **Quantize:** [GGUF](quantization/gguf.html)
